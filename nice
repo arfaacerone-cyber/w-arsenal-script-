@@ -1,0 +1,266 @@
+-- ============================================================
+--  FIXED FULL COMBINED CLIENT SCRIPT
+--  (LocalScript; put in StarterPlayerScripts)
+-- Features:
+--  - LoopSpeed (SPEED)
+--  - Safe infinite jump (tap space to extra-jump; no flying when held)
+--  - Teleport behind closest enemy (T)
+--  - Slope-safe dash forward (E)
+-- ============================================================
+
+local SPEED = 23 -- change walk speed here
+local TELEPORT_BEHIND_STUDS = 5
+local DASH_DISTANCE = 15
+local DASH_TIME = 0.15
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+
+-- wait for LocalPlayer (safe if script runs early)
+local player = Players.LocalPlayer
+if not player then
+	repeat task.wait() until Players.LocalPlayer
+	player = Players.LocalPlayer
+end
+
+-- character state (kept updated)
+local character = player.Character
+local humanoid = nil
+local humanoidRootPart = nil
+
+-- walk speed connection
+local wsConn = nil
+
+-- raycast params for dash (will be updated each respawn to exclude current character)
+local RAYCAST_PARAMS = RaycastParams.new()
+RAYCAST_PARAMS.FilterType = Enum.RaycastFilterType.Exclude
+RAYCAST_PARAMS.FilterDescendantsInstances = {} -- set on spawn
+
+-- helpers
+local function isNumber(v) return tonumber(v) ~= nil end
+
+local function humanoidIsOnGround(h)
+	if not h then return false end
+	local fm = h.FloorMaterial
+	if fm and fm ~= Enum.Material.Air then return true end
+	local st = h:GetState()
+	return (st == Enum.HumanoidStateType.Running)
+	    or (st == Enum.HumanoidStateType.Landed)
+	    or (st == Enum.HumanoidStateType.RunningNoPhysics)
+end
+
+-- Setup references when a character exists
+local function setupCharacterRefs(char)
+	character = char
+	if not character then
+		humanoid = nil
+		humanoidRootPart = nil
+		return
+	end
+
+	-- assign humanoid & hrp safely
+	humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 5)
+	humanoidRootPart = character:FindFirstChild("HumanoidRootPart") or character:WaitForChild("HumanoidRootPart", 5)
+
+	-- update raycast filter to exclude the current character
+	RAYCAST_PARAMS.FilterDescendantsInstances = { character }
+end
+
+-- Apply loop speed on a character's humanoid and keep it enforced
+local function applyLoopSpeedToCharacter(char)
+	-- clear previous conn
+	if wsConn then
+		pcall(function() wsConn:Disconnect() end)
+		wsConn = nil
+	end
+
+	if not char then return end
+	local h = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5)
+	if not h then return end
+	if not isNumber(SPEED) then return end
+	local speed = tonumber(SPEED)
+
+	-- function that forces walkspeed (safe pcall)
+	local function forceSpeed()
+		if h and h.Parent then
+			pcall(function() h.WalkSpeed = speed end)
+		end
+	end
+
+	-- apply immediately
+	forceSpeed()
+
+	-- reconnect property changed
+	wsConn = h:GetPropertyChangedSignal("WalkSpeed"):Connect(forceSpeed)
+end
+
+-- On CharacterAdded (respawn)
+local function onCharacterAdded(newChar)
+	setupCharacterRefs(newChar)
+	applyLoopSpeedToCharacter(newChar)
+end
+
+-- ensure we handle existing character if script ran after spawn
+if not player.Character then
+	-- wait for first character
+	player.CharacterAdded:Wait()
+end
+setupCharacterRefs(player.Character)
+applyLoopSpeedToCharacter(player.Character)
+
+-- connect CharacterAdded to rebind on respawn
+player.CharacterAdded:Connect(onCharacterAdded)
+
+-- -----------------------
+-- Safe infinite jump (no flying)
+-- Implementation:
+--  - Use InputBegan for Space to detect presses
+--  - Use InputEnded for Space to allow next press (debounce)
+--  - If on ground -> normal jump
+--  - If mid-air and you press -> allow one extra jump per press (no hold spam)
+-- -----------------------
+local spaceCanJump = true
+
+UserInputService.InputBegan:Connect(function(inp, gameProcessed)
+	if gameProcessed then return end
+	if inp.UserInputType == Enum.UserInputType.Keyboard and inp.KeyCode == Enum.KeyCode.Space then
+		-- ensure humanoid reference
+		if not humanoid and player.Character then
+			humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+		end
+
+		if humanoid then
+			if humanoidIsOnGround(humanoid) then
+				-- normal ground jump
+				pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Jumping) end)
+			else
+				-- in-air extra jump, only once per press
+				if spaceCanJump then
+					spaceCanJump = false
+					pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Jumping) end)
+				end
+			end
+		end
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(inp, gameProcessed)
+	if gameProcessed then return end
+	if inp.UserInputType == Enum.UserInputType.Keyboard and inp.KeyCode == Enum.KeyCode.Space then
+		spaceCanJump = true
+	end
+end)
+
+-- -----------------------
+-- Teleport behind closest enemy (T)
+-- -----------------------
+local function teleportBehindClosestEnemy()
+	-- refresh refs
+	if not player.Character then return end
+	local hrp = player.Character:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	local closest = nil
+	local closestDist = math.huge
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= player
+			and plr.Team ~= player.Team
+			and plr.Character
+			and plr.Character:FindFirstChild("HumanoidRootPart") then
+
+			local targetHRP = plr.Character:FindFirstChild("HumanoidRootPart")
+			if targetHRP then
+				local dist = (targetHRP.Position - hrp.Position).Magnitude
+				if dist < closestDist then
+					closestDist = dist
+					closest = plr
+				end
+			end
+		end
+	end
+
+	if not closest then
+		warn("No enemies found!")
+		return
+	end
+
+	local targetHRP = closest.Character and closest.Character:FindFirstChild("HumanoidRootPart")
+	if not targetHRP then return end
+
+	-- behind = +Z relative to target's CFrame
+	local behindCFrame = targetHRP.CFrame * CFrame.new(0, 0, TELEPORT_BEHIND_STUDS)
+
+	-- small upward bump to avoid clipping into ground / target
+	local bumped = behindCFrame + Vector3.new(0, 2, 0)
+
+	-- teleport
+	pcall(function() hrp.CFrame = bumped end)
+end
+
+-- -----------------------
+-- Dash forward (E) - slope safe using raycast down
+-- -----------------------
+local function getSafeDashCFrame()
+	if not humanoidRootPart then return nil end
+	local lookVector = humanoidRootPart.CFrame.LookVector
+	local startPos = humanoidRootPart.Position
+	local targetPos = startPos + lookVector * DASH_DISTANCE
+
+	-- cast down from targetPos to find ground height
+	local rayOrigin = targetPos + Vector3.new(0, 5, 0)
+	local rayDir = Vector3.new(0, -40, 0)
+	local result = Workspace:Raycast(rayOrigin, rayDir, RAYCAST_PARAMS)
+
+	if result and result.Position then
+		-- place a little above ground
+		return CFrame.new(result.Position + Vector3.new(0, 2, 0), result.Position + Vector3.new(0, 2, 0) + lookVector)
+	else
+		-- fallback: keep same Y as start
+		return CFrame.new(Vector3.new(targetPos.X, startPos.Y, targetPos.Z), Vector3.new(targetPos.X, startPos.Y, targetPos.Z) + lookVector)
+	end
+end
+
+local function doDash()
+	if not humanoidRootPart then return end
+	local goal = getSafeDashCFrame()
+	if not goal then return end
+
+	local tween = TweenService:Create(humanoidRootPart, TweenInfo.new(DASH_TIME, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {CFrame = goal})
+	tween:Play()
+end
+
+-- -----------------------
+-- Input handling for T (teleport) and E (dash)
+-- -----------------------
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	if input.UserInputType == Enum.UserInputType.Keyboard then
+		local key = input.KeyCode
+		if key == Enum.KeyCode.T then
+			teleportBehindClosestEnemy()
+		elseif key == Enum.KeyCode.E then
+			doDash()
+		end
+	end
+end)
+
+-- -----------------------
+-- Keep references updated on respawn
+-- -----------------------
+player.CharacterAdded:Connect(function(char)
+	-- small wait for important parts to exist
+	setupCharacterRefs(char)
+	applyLoopSpeedToCharacter(char)
+
+	-- update humanoid & hrp local vars for jump/dash/teleport usage
+	humanoid = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5)
+	humanoidRootPart = char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart", 5)
+
+	-- update raycast filter to exclude our new character
+	RAYCAST_PARAMS.FilterDescendantsInstances = { char }
+end)
+
+-- End of script
